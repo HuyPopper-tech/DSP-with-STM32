@@ -4,8 +4,9 @@
 #include "arm_math.h"
 
 /* --- Defines --- */
-#define FFT_SIZE      1024        /* Must be a power of 2 */
-#define SAMPLE_RATE   1000.0f     /* ADC Sample Rate (1kHz) */
+#define FFT_SIZE          1024        /* Must be a power of 2 */
+#define SAMPLE_RATE       1000.0f     /* ADC Sample Rate (1kHz) */
+#define TIM2_CLK_FLOAT    16000000.0f /* Timer 2 Clock Frequency */
 
 /* Thresholding logic defines */
 #define UPPER_THRESHOLD   3800    /* Start/end of a beat */
@@ -38,6 +39,7 @@ void UART_Init(void);
 void UART_SendChar(char c);
 void UART_SendString(char *s);
 void ADC_Init(void);
+void TIM2_Init(void);
 void LED_Init(void);
 void ProcessFFT(void);
 
@@ -53,6 +55,7 @@ int main(void) {
     /* Peripheral Initialization */
     LED_Init();
     UART_Init();
+    TIM2_Init();
     ADC_Init();
 
     /* Initialize CMSIS-DSP FFT */
@@ -77,7 +80,6 @@ int main(void) {
             ProcessFFT();
         }
 
-
         /*
          * TASK 2: Threshold-based Beat Detection
          * This runs much faster (approx 100 Hz) to detect individual beats.
@@ -98,7 +100,6 @@ int main(void) {
                     /* Calculate BPM: (60 seconds / interval in seconds) */
                     BPM_Threshold = (int) (60.0f / ((float) diff / 1000.0f));
 
-                    /* --- ADDED --- */
                     /* Toggle the LED on PA5 for every valid beat */
                     GPIOA->ODR ^= GPIO_ODR_OD5;
                 }
@@ -162,7 +163,6 @@ void ProcessFFT(void) {
     float32_t peak_freq = maxIndex * freq_res;
 
     /* 6. Convert frequency (Hz) to BPM */
-    /* --- ADDED --- */
     float32_t BPM_FFT = peak_freq * 60.0f;
 
     /* 7. Send results via UART */
@@ -172,7 +172,6 @@ void ProcessFFT(void) {
 
 /**
  * @brief Initializes PA5 (on-board LED) as an output.
- * --- ADDED ---
  */
 void LED_Init(void) {
     /* 1. Enable GPIOA Clock */
@@ -188,7 +187,50 @@ void LED_Init(void) {
 }
 
 /**
- * @brief Initializes ADC1 on Channel 1 (PA1) with DMA.
+ * @brief Initializes TIM2 to generate a trigger event (TRGO)
+ * at the frequency specified by SAMPLE_RATE.
+ *
+ * This function automatically calculates the optimal PSC and ARR
+ * values based on the TIM2_CLK_FLOAT and SAMPLE_RATE constants.
+ */
+void TIM2_Init(void) {
+    /* 1. Enable TIM2 Clock */
+    RCC->APB1ENR |= RCC_APB1ENR_TIM2EN;
+
+    /* 2. Calculate PSC and ARR dynamically */
+
+    /* Total number of timer ticks per sample */
+    uint32_t total_ticks = (uint32_t) (TIM2_CLK_FLOAT / SAMPLE_RATE);
+
+    /*
+     * Find the smallest PSC value that allows ARR to be < 65536.
+     * We start with PSC = 0 (so PSC+1 = 1).
+     * `arr = (total_ticks / (psc + 1)) - 1`
+     * If `arr` is too large, increment `psc` and recalculate.
+     */
+    uint32_t psc = 0;
+    uint32_t arr = total_ticks - 1;
+
+    while (arr > 0xFFFF) /* 0xFFFF is 65535 */
+    {
+        psc++;
+        arr = (total_ticks / (psc + 1)) - 1;
+    }
+
+    /* 3. Set the calculated Prescaler and Auto-Reload Register */
+    TIM2->PSC = psc;
+    TIM2->ARR = arr;
+
+    /* 4. Configure Master Mode Selection (MMS) -> TRGO on Update */
+    TIM2->CR2 &= ~TIM_CR2_MMS;
+    TIM2->CR2 |= TIM_CR2_MMS_1; /* 010: Update Event */
+
+    /* 5. Enable the Timer */
+    TIM2->CR1 |= TIM_CR1_CEN;
+}
+
+/**
+ * @brief Initializes ADC1 on Ch1 (PA1) with DMA, triggered by TIM2.
  */
 void ADC_Init(void) {
     /* 1. Enable clocks */
@@ -202,8 +244,7 @@ void ADC_Init(void) {
 
     /* 3. Configure DMA2 Stream 0, Channel 0 */
     DMA2_Stream0->CR &= ~DMA_SxCR_EN; /* Disable stream */
-    while (DMA2_Stream0->CR & DMA_SxCR_EN)
-        ; /* Wait for it to be disabled */
+    while (DMA2_Stream0->CR & DMA_SxCR_EN); /* Wait for it to be disabled */
 
     DMA2_Stream0->CR = 0; /* Reset config */
     DMA2_Stream0->CR |= (0 << DMA_SxCR_CHSEL_Pos); /* Channel 0 */
@@ -220,7 +261,7 @@ void ADC_Init(void) {
 
     /* Clear flags */
     DMA2->LIFCR = DMA_LIFCR_CTCIF0 | DMA_LIFCR_CHTIF0 | DMA_LIFCR_CTEIF0 |
-    DMA_LIFCR_CDMEIF0 | DMA_LIFCR_CFEIF0;
+                    DMA_LIFCR_CDMEIF0 | DMA_LIFCR_CFEIF0;
 
     /* Enable DMA stream */
     DMA2_Stream0->CR |= DMA_SxCR_EN;
@@ -230,8 +271,11 @@ void ADC_Init(void) {
     ADC1->CR2 = 0;
 
     ADC1->CR1 &= ~ADC_CR1_SCAN; /* Disable scan mode */
-    ADC1->CR2 |= ADC_CR2_CONT; /* Continuous conversion mode */
     ADC1->CR2 &= ~ADC_CR2_ALIGN; /* Right alignment */
+
+    /* Set external trigger to TIM2 TRGO */
+    ADC1->CR2 |= ADC_CR2_EXTEN_0; /* Trigger on rising edge */
+    ADC1->CR2 |= (0x6 << ADC_CR2_EXTSEL_Pos); /* EXTSEL = 0110: TIM2 TRGO */
 
     /* Set sequence (1 conversion, Channel 1) */
     ADC1->SQR1 = 0;
@@ -244,9 +288,6 @@ void ADC_Init(void) {
     /* Enable ADC */
     ADC1->CR2 |= ADC_CR2_ADON;
     HAL_Delay(1); /* Wait for ADC stable */
-
-    /* Start conversion */
-    ADC1->CR2 |= ADC_CR2_SWSTART;
 }
 
 /**
@@ -281,8 +322,7 @@ void UART_Init(void) {
  */
 void UART_SendChar(char c) {
     /* Wait for Transmit Data Register to be empty */
-    while (!(USART2->SR & USART_SR_TXE))
-        ;
+    while (!(USART2->SR & USART_SR_TXE));
 
     /* Send data */
     USART2->DR = c;
